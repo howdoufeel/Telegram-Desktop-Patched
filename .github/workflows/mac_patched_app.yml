@@ -9,6 +9,9 @@ on:
       - 'mac-v*'
     paths:
       - '.github/workflows/mac_patched_app.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'Telegram/**'
 
 concurrency:
   group: mac-patched-app-${{ github.ref }}
