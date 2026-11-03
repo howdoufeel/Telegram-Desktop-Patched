@@ -1,0 +1,217 @@
+name: MacOS Patched App.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'mac-v*'
+    paths:
+      - '.github/workflows/mac_patched_app.yml'
+
+concurrency:
+  group: mac-patched-app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PREPARE_PATH: Telegram/build/prepare/prepare.py
+  APP_NAME: Telegram Desktop Patched
+
+jobs:
+
+  libraries:
+    name: Libraries (pass ${{ matrix.pass }})
+    runs-on: macos-latest
+    timeout-minutes: 355
+
+    # Each pass resumes from the cache the previous one saved, so building
+    # the libraries may take longer than the limit of a single job.
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        pass: [1, 2, 3]
+
+    steps:
+      - name: Get repository name.
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.REPO_NAME }}
+
+      - name: Set cache keys.
+        run: |
+          PREFIX="${{ runner.os }}-patched-libs-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}"
+          echo "LIBS_DONE_KEY=$PREFIX-done" >> $GITHUB_ENV
+          echo "LIBS_PARTIAL_PREFIX=$PREFIX-partial-" >> $GITHUB_ENV
+
+      - name: Check finished libraries.
+        id: done
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ env.LIBS_DONE_KEY }}
+          lookup-only: true
+
+      - name: Restore partial libraries.
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ env.LIBS_PARTIAL_PREFIX }}${{ github.run_id }}
+          restore-keys: ${{ env.LIBS_PARTIAL_PREFIX }}
+
+      - name: First set up.
+        if: steps.done.outputs.cache-hit != 'true'
+        run: |
+          sudo chown -R `whoami`:admin /usr/local/share
+
+          brew update
+          brew upgrade || true
+          brew install automake libtool meson nasm ninja pkg-config
+
+          # Disable spotlight.
+          sudo mdutil -a -i off
+
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+          sudo sed -i '' '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/ -g//' /opt/homebrew/share/cmake/Modules/Compiler/GNU.cmake
+
+          rm -rf ~/Library/Android || true
+          df -h /
+
+      - name: Libraries.
+        id: prepare
+        if: steps.done.outputs.cache-hit != 'true'
+        timeout-minutes: 270
+        continue-on-error: true
+        run: ./$REPO_NAME/Telegram/build/prepare/mac.sh silent
+
+      - name: Free up some disk space.
+        if: always() && steps.done.outputs.cache-hit != 'true'
+        run: |
+          find Libraries '(' '(' ! '(' -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -perm +111 ')' -type f ')' -o -empty ')' -delete
+          ls Libraries/cache_keys ThirdParty/cache_keys || true
+          du -sh Libraries ThirdParty || true
+
+      - name: Save libraries.
+        if: always() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ steps.prepare.outcome == 'success' && env.LIBS_DONE_KEY || format('{0}{1}-{2}-{3}', env.LIBS_PARTIAL_PREFIX, github.run_id, github.run_attempt, matrix.pass) }}
+
+  app:
+    name: Telegram Desktop Patched
+    needs: libraries
+    if: ${{ !cancelled() }}
+    runs-on: macos-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Check API credentials.
+        env:
+          API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
+            echo "::error::Add the TDESKTOP_API_ID and TDESKTOP_API_HASH repository secrets from my.telegram.org, then re-run this job."
+            exit 1
+          fi
+
+      - name: Get repository name.
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.REPO_NAME }}
+
+      - name: Restore libraries.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ runner.os }}-patched-libs-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}-done
+          fail-on-cache-miss: true
+
+      - name: First set up.
+        run: |
+          sudo chown -R `whoami`:admin /usr/local/share
+
+          brew update
+          brew install automake libtool meson nasm ninja pkg-config
+
+          sudo mdutil -a -i off
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          df -h /
+
+      - name: Telegram Desktop Patched build.
+        env:
+          API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        run: |
+          cd $REPO_NAME/Telegram
+
+          ./configure.sh \
+          -D CMAKE_CONFIGURATION_TYPES=Release \
+          -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+          -D TDESKTOP_API_ID="$API_ID" \
+          -D TDESKTOP_API_HASH="$API_HASH" \
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON
+
+          cmake --build ../out --config Release --parallel
+
+      - name: Package.
+        run: |
+          cd $REPO_NAME
+          VERSION=$(sed -n 's/^AppVersionStrSmall *//p' Telegram/build/version)
+          DMG="Telegram-Desktop-Patched-$VERSION-macOS.dmg"
+          APP="out/Release/$APP_NAME.app"
+
+          lipo -info "$APP/Contents/MacOS/$APP_NAME"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP" || true
+
+          mkdir -p dmg
+          ditto "$APP" "dmg/$APP_NAME.app"
+          ln -s /Applications dmg/Applications
+          PACKAGE="$DMG"
+          for attempt in 1 2 3; do
+            hdiutil create -volname "$APP_NAME" -srcfolder dmg -ov -format UDZO "$DMG" && break
+            rm -f "$DMG"
+            sleep 30
+          done
+          if [ ! -f "$DMG" ]; then
+            PACKAGE="${DMG%.dmg}.zip"
+            ditto -c -k --keepParent "$APP" "$PACKAGE"
+          fi
+
+          echo "PACKAGE_PATH=$REPO_NAME/$PACKAGE" >> $GITHUB_ENV
+          {
+            echo "## $APP_NAME $VERSION"
+            echo
+            echo "Download the artifact below, open $PACKAGE and drag the app to Applications."
+            echo "Then run once in Terminal:"
+            echo
+            echo "    xattr -dr com.apple.quarantine \"/Applications/$APP_NAME.app\""
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact.
+        uses: actions/upload-artifact@v7
+        with:
+          name: Telegram Desktop Patched macOS
+          path: ${{ env.PACKAGE_PATH }}
+          retention-days: 14
