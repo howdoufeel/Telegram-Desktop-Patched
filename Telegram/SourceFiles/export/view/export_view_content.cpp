@@ -160,6 +160,18 @@ Content ContentFromState(
 		break;
 	default: Unexpected("Step in ContentFromState.");
 	}
+	if (state.transcribing) {
+		push(
+			u"transcription"_q,
+			tr::lng_export_transcribing(tr::now),
+			state.transcriptionWaitSeconds
+				? tr::lng_export_transcription_wait(
+					tr::now,
+					lt_duration,
+					QString::number(state.transcriptionWaitSeconds) + u" s"_q)
+				: QString(),
+			0.);
+	}
 	const auto requiredRows = settings->onlySinglePeer() ? 2 : 3;
 	while (result.rows.size() < requiredRows) {
 		result.rows.emplace_back();
@@ -190,6 +202,26 @@ Content ContentFromState(const FinishedState &state) {
 			Ui::FormatSizeText(state.bytesCount)),
 		QString(),
 		1. });
+	if (state.transcriptionsDone || state.transcriptionsFailed) {
+		result.rows.push_back({
+			Content::kDoneId,
+			tr::lng_export_transcriptions_done(
+				tr::now,
+				lt_amount,
+				QString::number(state.transcriptionsDone)),
+			QString(),
+			1. });
+	}
+	if (state.transcriptionsFailed) {
+		result.rows.push_back({
+			Content::kDoneId,
+			tr::lng_export_transcriptions_failed(
+				tr::now,
+				lt_amount,
+				QString::number(state.transcriptionsFailed)),
+			QString(),
+			1. });
+	}
 	return result;
 }
 

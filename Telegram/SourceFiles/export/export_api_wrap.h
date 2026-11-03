@@ -76,6 +76,8 @@ public:
 		int itemIndex = 0;
 		int64 ready = 0;
 		int64 total = 0;
+		bool transcribing = false;
+		int64 transcriptionWaitSeconds = 0;
 	};
 	void requestUserpics(
 		FnMut<bool(Data::UserpicsInfo&&)> start,
@@ -118,6 +120,8 @@ public:
 	void finishExport(FnMut<void()> done);
 	void skipFile(uint64 randomId);
 	void cancelExportFast();
+	[[nodiscard]] int transcriptionsDone() const;
+	[[nodiscard]] int transcriptionsFailed() const;
 
 	~ApiWrap();
 
@@ -217,6 +221,12 @@ private:
 		FnMut<void(MTPmessages_Messages&&)> done);
 	void startMessagesSlice(Data::MessagesSlice &&slice);
 	void resumeMessagesSlice();
+	void transcribeNextMessage();
+	void transcriptionDone(const MTPmessages_TranscribedAudio &result);
+	void transcriptionFailed(const MTP::Error &error);
+	void finishTranscription();
+	void scheduleTranscription(crl::time delay);
+	void transcriptionProgress(crl::time wait = 0);
 	void hydrateMessageDone(
 		bool topic,
 		int index,
@@ -330,7 +340,14 @@ private:
 	void error(const QString &text);
 	void ioError(const Output::Result &result);
 
+	Fn<void(FnMut<void()>)> _runner;
 	MTP::ConcurrentSender _mtp;
+	mtpRequestId _transcriptionRequestId = 0;
+	uint64 _transcriptionGeneration = 0;
+	QByteArray _transcriptionUnavailable;
+	int _transcriptionsDone = 0;
+	int _transcriptionsFailed = 0;
+	bool _transcriptionsCancelled = false;
 	std::optional<uint64> _takeoutId;
 	std::optional<UserId> _selfId;
 	Output::Stats *_stats = nullptr;

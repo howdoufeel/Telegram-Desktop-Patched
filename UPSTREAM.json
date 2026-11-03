@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/telegramdesktop/tdesktop",
+  "tag": "v7.2.9",
+  "commit": "fb2e33209517e1a34637d837bfadb3783f2fd59c",
+  "tree": "576423b081f98c292cd48dea14fb97920fd4091e",
+  "import_commit": "ef723297217e803fcae82fb426847367bff6623a",
+  "patch_sha256": "f5c4014007393634800cce73249768add727f96552adf823fda15759899e7352",
+  "submodules": "Original gitlink paths and pinned commits are preserved. Clone with --recurse-submodules."
+}

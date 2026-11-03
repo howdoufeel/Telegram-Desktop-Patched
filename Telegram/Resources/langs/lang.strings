@@ -7429,6 +7429,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_export_option_photos" = "Photos";
 "lng_export_option_video_files" = "Videos";
 "lng_export_option_voice_messages" = "Voice messages";
+"lng_export_voice_transcriptions" = "Добавлять расшифровки голосовых";
+"lng_export_voice_transcriptions_about" = "Получать тексты через Telegram и сохранять в JSON и HTML. Для массовой обработки нужен Telegram Premium. Скачивание аудио включается отдельно.";
+"lng_export_transcribing" = "Расшифровка голосовых…";
+"lng_export_transcription_wait" = "Ожидание Telegram: {duration}";
+"lng_export_transcriptions_done" = "Расшифровок сохранено: {amount}";
+"lng_export_transcriptions_failed" = "Без полной расшифровки: {amount}";
 "lng_export_option_video_messages" = "Video messages";
 "lng_export_option_stickers" = "Stickers";
 "lng_export_option_gifs" = "GIFs";

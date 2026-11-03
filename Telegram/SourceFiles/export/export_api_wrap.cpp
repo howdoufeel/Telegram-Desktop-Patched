@@ -8,11 +8,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "export/export_api_wrap.h"
 
 #include "export/export_settings.h"
+#include "export/export_transcription_policy.h"
 #include "export/data/export_data_types.h"
 #include "export/output/export_output_result.h"
 #include "export/output/export_output_file.h"
 #include "mtproto/mtproto_response.h"
 #include "base/bytes.h"
+#include "base/call_delayed.h"
 #include "base/options.h"
 #include "base/random.h"
 #include <set>
@@ -569,6 +571,8 @@ struct ApiWrap::AbstractMessagesProcess {
 	std::vector<MessageFileWork> messageFileWork;
 	bool lastSlice = false;
 	int hydrationIndex = 0;
+	int transcriptionIndex = 0;
+	TranscriptionRetryPolicy transcriptionRetry;
 	int fileIndex = 0;
 	int messageFileWorkIndex = 0;
 	int messageFileWorkMessageIndex = -1;
@@ -774,7 +778,8 @@ auto ApiWrap::fileRequest(const Data::FileLocation &location, int64 offset) {
 ApiWrap::ApiWrap(
 	base::weak_qptr<MTP::Instance> weak,
 	Fn<void(FnMut<void()>)> runner)
-: _mtp(weak, std::move(runner))
+: _runner(std::move(runner))
+, _mtp(weak, _runner)
 , _fileCache(std::make_unique<LoadedFileCache>(kLocationCacheSize)) {
 }
 
@@ -1891,6 +1896,11 @@ void ApiWrap::skipFile(uint64 randomId) {
 }
 
 void ApiWrap::cancelExportFast() {
+	_transcriptionsCancelled = true;
+	++_transcriptionGeneration;
+	if (_transcriptionRequestId) {
+		_mtp.request(base::take(_transcriptionRequestId)).cancel();
+	}
 	if (_takeoutId.has_value()) {
 		const auto requestId = mainRequest(MTPaccount_FinishTakeoutSession(
 			MTP_flags(0)
@@ -2325,6 +2335,8 @@ void ApiWrap::startMessagesSlice(Data::MessagesSlice &&slice) {
 	}
 	process->slice = std::move(slice);
 	process->hydrationIndex = 0;
+	process->transcriptionIndex = 0;
+	process->transcriptionRetry = {};
 	process->fileIndex = 0;
 	process->messageFileWork.clear();
 	process->messageFileWorkIndex = 0;
@@ -2374,12 +2386,178 @@ void ApiWrap::resumeMessagesSlice() {
 		return;
 	}
 
+	transcribeNextMessage();
+}
+
+void ApiWrap::transcribeNextMessage() {
+	if (_transcriptionsCancelled) {
+		return;
+	}
+	const auto topic = (_topicProcess != nullptr);
+	const auto process = topic
+		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
+		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
+	Expects(process != nullptr && process->slice.has_value());
+	Expects(!_transcriptionRequestId);
+
+	auto &list = process->slice->list;
+	while (_settings->includeVoiceTranscriptions
+		&& process->transcriptionIndex < list.size()) {
+		auto &message = list[process->transcriptionIndex];
+		const auto document = std::get_if<Data::Document>(
+			&message.media.content);
+		if (!document
+			|| !document->isVoiceMessage
+			|| Data::SkipMessageByDate(message, *_settings)) {
+			++process->transcriptionIndex;
+			continue;
+		}
+		if (!message.voiceTranscription) {
+			message.voiceTranscription.emplace();
+		}
+		if (!_transcriptionUnavailable.isEmpty()) {
+			message.voiceTranscription->status = "failed";
+			message.voiceTranscription->error = _transcriptionUnavailable;
+			++_transcriptionsFailed;
+			++process->transcriptionIndex;
+			continue;
+		}
+		auto peer = topic ? _topicProcess->inputPeer : _chatProcess->info.input;
+		if (!topic) {
+			const auto split = _chatProcess->info.splits[
+				_chatProcess->localSplitIndex];
+			if (split < 0) {
+				peer = _chatProcess->info.migratedFromInput;
+			}
+		}
+		transcriptionProgress();
+		if (_transcriptionsCancelled) {
+			return;
+		}
+		_transcriptionRequestId = _mtp.request(MTPmessages_TranscribeAudio(
+			peer,
+			MTP_int(message.id)
+		)).done([=](const MTPmessages_TranscribedAudio &result) {
+			_transcriptionRequestId = 0;
+			if (!_transcriptionsCancelled) {
+				transcriptionDone(result);
+			}
+		}).fail([=](const MTP::Error &error) {
+			_transcriptionRequestId = 0;
+			if (!_transcriptionsCancelled) {
+				transcriptionFailed(error);
+			}
+		}).handleFloodErrors().send();
+		return;
+	}
 	collectMessagesCustomEmoji(*process->slice);
 	if (topic) {
 		resolveTopicCustomEmoji();
 	} else {
 		resolveCustomEmoji();
 	}
+}
+
+void ApiWrap::transcriptionDone(const MTPmessages_TranscribedAudio &result) {
+	const auto process = _topicProcess
+		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
+		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
+	auto &entry = *process->slice->list[
+		process->transcriptionIndex].voiceTranscription;
+	const auto &data = result.data();
+	entry.id = data.vtranscription_id().v;
+	entry.text = Data::ParseString(data.vtext());
+	if (data.is_pending()) {
+		entry.status = "pending";
+		if (process->transcriptionRetry.retryPending()) {
+			scheduleTranscription(5000);
+			return;
+		}
+		entry.error = "TRANSCRIPTION_TIMEOUT";
+	} else {
+		entry.status = entry.text.isEmpty() ? "empty" : "done";
+	}
+	finishTranscription();
+}
+
+void ApiWrap::transcriptionFailed(const MTP::Error &error) {
+	const auto process = _topicProcess
+		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
+		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
+	const auto type = error.type().toUtf8();
+	const auto view = std::string_view(type.constData(), type.size());
+	if (const auto delay = process->transcriptionRetry.floodDelay(view)) {
+		scheduleTranscription(*delay);
+		return;
+	}
+	auto &entry = *process->slice->list[
+		process->transcriptionIndex].voiceTranscription;
+	entry.status = "failed";
+	entry.error = type;
+	if (TranscriptionRetryPolicy::IsFlood(view)) {
+		_transcriptionUnavailable = type;
+	}
+	finishTranscription();
+}
+
+void ApiWrap::finishTranscription() {
+	const auto process = _topicProcess
+		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
+		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
+	const auto &entry = *process->slice->list[
+		process->transcriptionIndex].voiceTranscription;
+	if (entry.status == "done") {
+		++_transcriptionsDone;
+	} else {
+		++_transcriptionsFailed;
+	}
+	++process->transcriptionIndex;
+	process->transcriptionRetry = {};
+	scheduleTranscription(1000);
+}
+
+void ApiWrap::scheduleTranscription(crl::time delay) {
+	const auto generation = ++_transcriptionGeneration;
+	const auto runner = _runner;
+	const auto interval = std::min(delay, crl::time(60'000));
+	transcriptionProgress(delay);
+	// The runner is owned by the controller's weak_on_queue.
+	crl::on_main([=] {
+		base::call_delayed(interval, [=] {
+			runner([=] {
+				if (_transcriptionsCancelled
+					|| generation != _transcriptionGeneration) {
+					return;
+				}
+				if (delay > interval) {
+					scheduleTranscription(delay - interval);
+				} else {
+					transcribeNextMessage();
+				}
+			});
+		});
+	});
+}
+
+void ApiWrap::transcriptionProgress(crl::time wait) {
+	const auto process = _topicProcess
+		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
+		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
+	if (!process->fileProgress(DownloadProgress{
+		.itemIndex = process->transcriptionIndex,
+		.transcribing = true,
+		.transcriptionWaitSeconds = (wait + 999) / 1000,
+	})) {
+		_transcriptionsCancelled = true;
+	}
+}
+
+int ApiWrap::transcriptionsDone() const {
+	return _transcriptionsDone;
+}
+
+int ApiWrap::transcriptionsFailed() const {
+	return _transcriptionsFailed;
 }
 
 void ApiWrap::hydrateMessageDone(

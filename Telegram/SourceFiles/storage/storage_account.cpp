@@ -2950,6 +2950,7 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 		&& settings.path == check.path
 		&& settings.format == check.format
 		&& settings.availableAt == check.availableAt
+		&& settings.includeVoiceTranscriptions == check.includeVoiceTranscriptions
 		&& !settings.onlySinglePeer()) {
 		if (_exportSettingsKey) {
 			ClearKey(_exportSettingsKey, _basePath);
@@ -2962,7 +2963,7 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 		_exportSettingsKey = GenerateKey(_basePath);
 		writeMapQueued();
 	}
-	quint32 size = sizeof(quint32) * 6
+	quint32 size = sizeof(quint32) * 7
 		+ Serialize::stringSize(settings.path)
 		+ sizeof(qint32) * 2 + sizeof(quint64);
 	EncryptedDescriptor data(size);
@@ -2997,6 +2998,7 @@ void Account::writeExportSettings(const Export::Settings &settings) {
 	});
 	data.stream << qint32(settings.singlePeerFrom);
 	data.stream << qint32(settings.singlePeerTill);
+	data.stream << quint32(settings.includeVoiceTranscriptions);
 
 	FileWriteDescriptor file(_exportSettingsKey, _basePath);
 	file.writeEncrypted(data, _localKey);
@@ -3023,6 +3025,7 @@ Export::Settings Account::readExportSettings() {
 	quint64 singlePeerBareId = 0;
 	quint64 singlePeerAccessHash = 0;
 	qint32 singlePeerFrom = 0, singlePeerTill = 0;
+	quint32 includeVoiceTranscriptions = 0;
 	file.stream
 		>> types
 		>> fullChats
@@ -3052,6 +3055,9 @@ Export::Settings Account::readExportSettings() {
 	}
 	if (!file.stream.atEnd()) {
 		file.stream >> singlePeerFrom >> singlePeerTill;
+	}
+	if (!file.stream.atEnd()) {
+		file.stream >> includeVoiceTranscriptions;
 	}
 	auto result = Export::Settings();
 	result.types = Export::Settings::Types::from_raw(types);
@@ -3093,6 +3099,7 @@ Export::Settings Account::readExportSettings() {
 	}();
 	result.singlePeerFrom = singlePeerFrom;
 	result.singlePeerTill = singlePeerTill;
+	result.includeVoiceTranscriptions = (includeVoiceTranscriptions == 1);
 	return (file.stream.status() == QDataStream::Ok && result.validate())
 		? result
 		: Export::Settings();

@@ -1254,6 +1254,13 @@ struct HistoryMessageMarkupButton {
 	int64 buttonId = 0;
 };
 
+struct VoiceTranscription {
+	Utf8String status;
+	Utf8String text;
+	Utf8String error;
+	uint64 id = 0;
+};
+
 struct Message {
 	int32 id = 0;
 	TimeId date = 0;
@@ -1278,6 +1285,7 @@ struct Message {
 	bool out = false;
 	std::vector<std::vector<HistoryMessageMarkupButton>> inlineButtonRows;
 	std::optional<RichMessage> richMessage;
+	std::optional<VoiceTranscription> voiceTranscription;
 
 	File &file();
 	const File &file() const;

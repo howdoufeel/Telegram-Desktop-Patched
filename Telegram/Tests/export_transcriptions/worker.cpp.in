@@ -1,0 +1,307 @@
+#include "export/export_transcription_policy.h"
+
+#include <cassert>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+using uint64 = std::uint64_t;
+using int64 = std::int64_t;
+using mtpRequestId = int;
+template <typename T> using FnMut = std::function<T>;
+#define Expects(x) assert(x)
+
+struct QByteArray : std::string {
+    using std::string::string;
+    using std::string::operator=;
+    bool isEmpty() const { return empty(); }
+    const char *constData() const { return data(); }
+    QByteArray toUtf8() const { return *this; }
+};
+namespace Clock {
+int64 now = 0;
+std::multimap<int64, FnMut<void()>> tasks;
+void Run() {
+    auto count = 0;
+    while (!tasks.empty()) {
+        assert(++count < 10000);
+        auto i = tasks.begin();
+        now = i->first;
+        auto task = std::move(i->second);
+        tasks.erase(i);
+        task();
+    }
+}
+void Reset() { tasks.clear(); now = 0; }
+}
+namespace crl {
+using time = int64;
+template <typename F> void on_main(F f) { f(); }
+}
+namespace base {
+template <typename F> void call_delayed(crl::time delay, F f) {
+    Clock::tasks.emplace(Clock::now + delay, std::move(f));
+}
+}
+struct MTPmessages_TranscribedAudio {
+    struct Data {
+        bool pending = false;
+        QByteArray text;
+        uint64 id = 42;
+        bool is_pending() const { return pending; }
+        const QByteArray &vtext() const { return text; }
+        struct Long { uint64 v; };
+        Long vtranscription_id() const { return {id}; }
+    } value;
+    const Data &data() const { return value; }
+};
+struct MTPmessages_TranscribeAudio { int peer; int id; };
+int MTP_int(int value) { return value; }
+namespace MTP {
+struct Error {
+    QByteArray value;
+    const QByteArray &type() const { return value; }
+};
+struct Reply {
+    bool pending = false;
+    QByteArray text = "complete";
+    QByteArray error;
+};
+struct Sender {
+    struct Sent { int peer; int id; int64 at; };
+    std::vector<Sent> sent;
+    std::deque<Reply> replies;
+    int nextId = 0;
+    struct Builder {
+        Sender *owner;
+        MTPmessages_TranscribeAudio call;
+        FnMut<void(const MTPmessages_TranscribedAudio&)> success;
+        FnMut<void(const Error&)> failure;
+        Builder &done(decltype(success) f) { success = std::move(f); return *this; }
+        Builder &fail(decltype(failure) f) { failure = std::move(f); return *this; }
+        Builder &handleFloodErrors() { return *this; }
+        mtpRequestId send() {
+            owner->sent.push_back({call.peer, call.id, Clock::now});
+            auto reply = Reply();
+            if (!owner->replies.empty()) {
+                reply = owner->replies.front();
+                owner->replies.pop_front();
+            }
+            base::call_delayed(1, [=, *this] {
+                if (!reply.error.empty()) {
+                    failure(Error{reply.error});
+                } else {
+                    success(MTPmessages_TranscribedAudio{{reply.pending, reply.text, 42}});
+                }
+            });
+            return ++owner->nextId;
+        }
+    };
+    Builder request(MTPmessages_TranscribeAudio call) {
+        return {this, call, {}, {}};
+    }
+};
+}
+
+namespace Export {
+struct Settings {
+    bool includeVoiceTranscriptions = true;
+    int from = 0;
+    int till = 100;
+};
+namespace Data {
+struct Document { bool isVoiceMessage = false; };
+struct VoiceTranscription {
+    QByteArray status, text, error;
+    uint64 id = 0;
+};
+struct Message {
+    int id = 0;
+    int date = 1;
+    struct Media { std::variant<std::monostate, Document> content; } media;
+    std::optional<VoiceTranscription> voiceTranscription;
+};
+struct MessagesSlice { std::vector<Message> list; };
+bool SkipMessageByDate(const Message &m, const Settings &s) {
+    return m.date < s.from || m.date >= s.till;
+}
+QByteArray ParseString(const QByteArray &s) { return s; }
+}
+class ApiWrap {
+public:
+    struct DownloadProgress {
+        int itemIndex = 0;
+        bool transcribing = false;
+        int64 transcriptionWaitSeconds = 0;
+    };
+    struct AbstractMessagesProcess {
+        std::optional<Data::MessagesSlice> slice;
+        int transcriptionIndex = 0;
+        TranscriptionRetryPolicy transcriptionRetry;
+        std::vector<DownloadProgress> progress;
+        bool acceptProgress = true;
+        bool fileProgress(DownloadProgress p) {
+            progress.push_back(p);
+            return acceptProgress;
+        }
+    };
+    struct ChatProcess : AbstractMessagesProcess {
+        struct Info {
+            int input = 11;
+            int migratedFromInput = 22;
+            std::vector<int> splits = {0};
+        } info;
+        int localSplitIndex = 0;
+    };
+    struct TopicProcess : AbstractMessagesProcess { int inputPeer = 33; };
+    std::unique_ptr<Settings> _settings = std::make_unique<Settings>();
+    std::unique_ptr<ChatProcess> _chatProcess = std::make_unique<ChatProcess>();
+    std::unique_ptr<TopicProcess> _topicProcess;
+    MTP::Sender _mtp;
+    FnMut<void(FnMut<void()>)> _runner = [](FnMut<void()> f) { f(); };
+    mtpRequestId _transcriptionRequestId = 0;
+    uint64 _transcriptionGeneration = 0;
+    QByteArray _transcriptionUnavailable;
+    bool _transcriptionsCancelled = false;
+    int _transcriptionsDone = 0;
+    int _transcriptionsFailed = 0;
+    int continued = 0;
+
+    void collectMessagesCustomEmoji(const Data::MessagesSlice &) {}
+    void resolveTopicCustomEmoji() { ++continued; }
+    void resolveCustomEmoji() { ++continued; }
+    void transcribeNextMessage();
+    void transcriptionDone(const MTPmessages_TranscribedAudio &);
+    void transcriptionFailed(const MTP::Error &);
+    void finishTranscription();
+    void scheduleTranscription(crl::time);
+    void transcriptionProgress(crl::time wait = 0);
+    int transcriptionsDone() const;
+    int transcriptionsFailed() const;
+
+};
+
+// PRODUCTION_METHODS
+
+Data::Message Voice(int id, int date = 1) {
+    return {id, date, {{Data::Document{true}}}, {}};
+}
+void Fill(ApiWrap &api, std::vector<Data::Message> list) {
+    api._chatProcess->slice = Data::MessagesSlice{std::move(list)};
+}
+const Data::VoiceTranscription &Entry(const ApiWrap &api, int index = 0) {
+    return *api._chatProcess->slice->list[index].voiceTranscription;
+}
+}
+
+int main() {
+    using namespace Export;
+    {
+        TranscriptionRetryPolicy policy;
+        assert(policy.floodDelay("FLOOD_WAIT_3600") == 3'600'000);
+        assert(policy.floodDelay("FLOOD_PREMIUM_WAIT_2") == 2000);
+        assert(!policy.floodDelay("FLOOD_WAIT_-5"));
+        assert(!policy.floodDelay("FLOOD_WAIT_1extra"));
+        assert(!policy.floodDelay("FLOOD_WAIT_999999999999999999"));
+        assert(!policy.floodDelay("TRANSCRIPTION_FAILED"));
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._settings->includeVoiceTranscriptions = false;
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.empty() && api.continued == 1);
+        assert(!api._chatProcess->slice->list[0].voiceTranscription);
+    }
+    {
+        Clock::Reset(); ApiWrap api;
+        Fill(api, {Voice(1, 0), Voice(2, 1), Voice(3, 100), Data::Message{}});
+        api._settings->from = 1;
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.size() == 1 && api._mtp.sent[0].id == 2);
+        assert(api.transcriptionsDone() == 1 && api.continued == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(7)});
+        api._chatProcess->info.splits = {-1};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent[0].peer == 22 && api._mtp.sent[0].id == 7);
+    }
+    {
+        Clock::Reset(); ApiWrap api;
+        api._chatProcess.reset(); api._topicProcess = std::make_unique<ApiWrap::TopicProcess>();
+        api._topicProcess->slice = Data::MessagesSlice{{Voice(9)}};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent[0].peer == 33 && api.continued == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._mtp.replies = {{true, "partial", {}}, {false, "full", {}}};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.size() == 2 && Entry(api).text == "full");
+        assert(Entry(api).status == "done" && api.transcriptionsFailed() == 0);
+        assert(api._mtp.sent[1].at >= 5000);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._mtp.replies.assign(36, {true, "partial", {}});
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.size() == 36 && Entry(api).status == "pending");
+        assert(Entry(api).text == "partial" && Entry(api).error == "TRANSCRIPTION_TIMEOUT");
+        assert(api.transcriptionsFailed() == 1 && api.continued == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1), Voice(2)});
+        api._mtp.replies = {{false, {}, "MSG_VOICE_TOO_LONG"}, {false, "ok", {}}};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(Entry(api).status == "failed" && Entry(api, 1).status == "done");
+        assert(api.transcriptionsDone() == 1 && api.transcriptionsFailed() == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._mtp.replies = {{false, {}, "FLOOD_PREMIUM_WAIT_125"}, {false, "ok", {}}};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.size() == 2 && api._mtp.sent[1].at >= 125000);
+        assert(Entry(api).status == "done");
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1), Voice(2)});
+        api._mtp.replies.assign(6, {false, {}, "FLOOD"});
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.size() == 6 && api.transcriptionsFailed() == 2);
+        assert(Entry(api, 1).error == "FLOOD" && api.continued == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._mtp.replies = {{false, {}, {}}};
+        api.transcribeNextMessage(); Clock::Run();
+        assert(Entry(api).status == "empty" && api.transcriptionsFailed() == 1);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._mtp.replies = {{true, "partial", {}}};
+        api.transcribeNextMessage();
+        base::call_delayed(2, [&] { api._transcriptionsCancelled = true; });
+        Clock::Run();
+        assert(api._mtp.sent.size() == 1 && api.continued == 0);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api.transcribeNextMessage(); api._transcriptionsCancelled = true;
+        Clock::Run();
+        assert(api.transcriptionsDone() == 0 && api.continued == 0);
+    }
+    {
+        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
+        api._chatProcess->acceptProgress = false;
+        api.transcribeNextMessage(); Clock::Run();
+        assert(api._mtp.sent.empty());
+    }
+    std::cout << "PASS: retry policy and 13 production-queue scenarios\n";
+}

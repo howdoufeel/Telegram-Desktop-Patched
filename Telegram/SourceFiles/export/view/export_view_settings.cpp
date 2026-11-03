@@ -811,6 +811,25 @@ void SettingsWidget::addMediaOptions(
 		tr::lng_export_option_files(tr::now),
 		MediaType::File);
 	addSizeSlider(container, files);
+	const auto transcriptions = container->add(
+		object_ptr<Ui::Checkbox>(
+			container,
+			tr::lng_export_voice_transcriptions(tr::now),
+			readData().includeVoiceTranscriptions,
+			st::defaultBoxCheckbox),
+		st::exportSettingPadding);
+	transcriptions->checkedChanges(
+	) | rpl::on_next([=](bool checked) {
+		changeData([&](Settings &data) {
+			data.includeVoiceTranscriptions = checked;
+		});
+	}, transcriptions->lifetime());
+	container->add(
+		object_ptr<Ui::FlatLabel>(
+			container,
+			tr::lng_export_voice_transcriptions_about(tr::now),
+			st::exportAboutOptionLabel),
+		st::exportAboutOptionPadding);
 }
 
 not_null<Ui::Checkbox*> SettingsWidget::addMediaOption(

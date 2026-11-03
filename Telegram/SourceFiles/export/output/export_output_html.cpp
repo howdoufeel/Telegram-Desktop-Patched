@@ -4554,6 +4554,21 @@ auto HtmlWriter::Wrap::pushMessage(
 			block.append(popTag());
 		}
 	}
+	if (message.voiceTranscription) {
+		const auto &data = *message.voiceTranscription;
+		block.append(pushDiv("details"));
+		block.append("Voice transcription (Telegram): ");
+		block.append(SerializeString(data.status));
+		if (!data.error.isEmpty()) {
+			block.append(" — " + SerializeString(data.error));
+		}
+		block.append(popTag());
+		if (!data.text.isEmpty()) {
+			block.append(pushDiv("text"));
+			block.append(SerializeString(data.text));
+			block.append(popTag());
+		}
+	}
 	if (!message.inlineButtonRows.empty()) {
 		using Type = HistoryMessageMarkupButton::Type;
 		const auto endline = u" | "_q;

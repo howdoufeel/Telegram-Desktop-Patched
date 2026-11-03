@@ -73,6 +73,8 @@ struct ProcessingState {
 	QString bytesName;
 	int64 bytesLoaded = 0;
 	int64 bytesCount = 0;
+	bool transcribing = false;
+	int64 transcriptionWaitSeconds = 0;
 };
 
 struct ApiErrorState {
@@ -90,6 +92,8 @@ struct FinishedState {
 	QString path;
 	int filesCount = 0;
 	int64 bytesCount = 0;
+	int transcriptionsDone = 0;
+	int transcriptionsFailed = 0;
 };
 
 using State = std::variant<

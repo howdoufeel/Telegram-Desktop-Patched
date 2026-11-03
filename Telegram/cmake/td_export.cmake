@@ -18,6 +18,7 @@ PRIVATE
     export/export_pch.h
     export/export_settings.cpp
     export/export_settings.h
+    export/export_transcription_policy.h
     export/data/export_data_types.cpp
     export/data/export_data_types.h
     export/output/export_output_abstract.cpp

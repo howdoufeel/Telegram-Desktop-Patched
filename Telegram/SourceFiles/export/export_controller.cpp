@@ -753,6 +753,8 @@ void ControllerObject::fillMessagesState(
 	}
 	result.bytesLoaded = progress.ready;
 	result.bytesCount = progress.total;
+	result.transcribing = progress.transcribing;
+	result.transcriptionWaitSeconds = progress.transcriptionWaitSeconds;
 }
 
 int ControllerObject::substepsInStep(Step step) const {
@@ -823,6 +825,8 @@ ProcessingState ControllerObject::stateTopic(
 		}
 		result.bytesLoaded = progress.ready;
 		result.bytesCount = progress.total;
+		result.transcribing = progress.transcribing;
+		result.transcriptionWaitSeconds = progress.transcriptionWaitSeconds;
 	});
 }
 
@@ -830,7 +834,9 @@ void ControllerObject::setFinishedState() {
 	setState(FinishedState{
 		_writer->mainFilePath(),
 		_stats.filesCount(),
-		_stats.bytesCount() });
+		_stats.bytesCount(),
+		_api.transcriptionsDone(),
+		_api.transcriptionsFailed() });
 }
 
 Controller::Controller(

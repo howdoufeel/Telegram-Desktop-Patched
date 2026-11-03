@@ -78,6 +78,7 @@ struct Settings {
 
 	QString path;
 	bool forceSubPath = false;
+	bool includeVoiceTranscriptions = false;
 	Output::Format format = Output::Format();
 
 	Types types = DefaultTypes();

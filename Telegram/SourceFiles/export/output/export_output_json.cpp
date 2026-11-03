@@ -2298,6 +2298,17 @@ QByteArray SerializeMessage(
 		pushBare("text_entities", SerializeText(context, message.text, true));
 	}
 
+	if (message.voiceTranscription) {
+		const auto &data = *message.voiceTranscription;
+		pushBare("voice_transcription", SerializeObject(context, {
+			{ "provider", SerializeString("telegram") },
+			{ "status", SerializeString(data.status) },
+			{ "text", SerializeString(data.text) },
+			{ "error", SerializeString(data.error) },
+			{ "transcription_id", SerializeString(Data::NumberToString(data.id)) },
+		}));
+	}
+
 	if (!message.inlineButtonRows.empty()) {
 		const auto serializeRow = [&](
 				const std::vector<HistoryMessageMarkupButton> &row) {

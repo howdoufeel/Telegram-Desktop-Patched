@@ -1,0 +1,986 @@
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -7435,6 +7435,12 @@
+ "lng_export_option_photos" = "Photos";
+ "lng_export_option_video_files" = "Videos";
+ "lng_export_option_voice_messages" = "Voice messages";
++"lng_export_voice_transcriptions" = "Добавлять расшифровки голосовых";
++"lng_export_voice_transcriptions_about" = "Получать тексты через Telegram и сохранять в JSON и HTML. Для массовой обработки нужен Telegram Premium. Скачивание аудио включается отдельно.";
++"lng_export_transcribing" = "Расшифровка голосовых…";
++"lng_export_transcription_wait" = "Ожидание Telegram: {duration}";
++"lng_export_transcriptions_done" = "Расшифровок сохранено: {amount}";
++"lng_export_transcriptions_failed" = "Без полной расшифровки: {amount}";
+ "lng_export_option_video_messages" = "Video messages";
+ "lng_export_option_stickers" = "Stickers";
+ "lng_export_option_gifs" = "GIFs";
+diff --git a/Telegram/SourceFiles/export/export_settings.h b/Telegram/SourceFiles/export/export_settings.h
+--- a/Telegram/SourceFiles/export/export_settings.h
++++ b/Telegram/SourceFiles/export/export_settings.h
+@@ -78,6 +78,7 @@
+ 
+ 	QString path;
+ 	bool forceSubPath = false;
++	bool includeVoiceTranscriptions = false;
+ 	Output::Format format = Output::Format();
+ 
+ 	Types types = DefaultTypes();
+diff --git a/Telegram/SourceFiles/export/view/export_view_settings.cpp b/Telegram/SourceFiles/export/view/export_view_settings.cpp
+--- a/Telegram/SourceFiles/export/view/export_view_settings.cpp
++++ b/Telegram/SourceFiles/export/view/export_view_settings.cpp
+@@ -811,6 +811,25 @@
+ 		tr::lng_export_option_files(tr::now),
+ 		MediaType::File);
+ 	addSizeSlider(container, files);
++	const auto transcriptions = container->add(
++		object_ptr<Ui::Checkbox>(
++			container,
++			tr::lng_export_voice_transcriptions(tr::now),
++			readData().includeVoiceTranscriptions,
++			st::defaultBoxCheckbox),
++		st::exportSettingPadding);
++	transcriptions->checkedChanges(
++	) | rpl::on_next([=](bool checked) {
++		changeData([&](Settings &data) {
++			data.includeVoiceTranscriptions = checked;
++		});
++	}, transcriptions->lifetime());
++	container->add(
++		object_ptr<Ui::FlatLabel>(
++			container,
++			tr::lng_export_voice_transcriptions_about(tr::now),
++			st::exportAboutOptionLabel),
++		st::exportAboutOptionPadding);
+ }
+ 
+ not_null<Ui::Checkbox*> SettingsWidget::addMediaOption(
+diff --git a/Telegram/SourceFiles/storage/storage_account.cpp b/Telegram/SourceFiles/storage/storage_account.cpp
+--- a/Telegram/SourceFiles/storage/storage_account.cpp
++++ b/Telegram/SourceFiles/storage/storage_account.cpp
+@@ -2950,6 +2950,7 @@
+ 		&& settings.path == check.path
+ 		&& settings.format == check.format
+ 		&& settings.availableAt == check.availableAt
++		&& settings.includeVoiceTranscriptions == check.includeVoiceTranscriptions
+ 		&& !settings.onlySinglePeer()) {
+ 		if (_exportSettingsKey) {
+ 			ClearKey(_exportSettingsKey, _basePath);
+@@ -2962,7 +2963,7 @@
+ 		_exportSettingsKey = GenerateKey(_basePath);
+ 		writeMapQueued();
+ 	}
+-	quint32 size = sizeof(quint32) * 6
++	quint32 size = sizeof(quint32) * 7
+ 		+ Serialize::stringSize(settings.path)
+ 		+ sizeof(qint32) * 2 + sizeof(quint64);
+ 	EncryptedDescriptor data(size);
+@@ -2997,6 +2998,7 @@
+ 	});
+ 	data.stream << qint32(settings.singlePeerFrom);
+ 	data.stream << qint32(settings.singlePeerTill);
++	data.stream << quint32(settings.includeVoiceTranscriptions);
+ 
+ 	FileWriteDescriptor file(_exportSettingsKey, _basePath);
+ 	file.writeEncrypted(data, _localKey);
+@@ -3023,6 +3025,7 @@
+ 	quint64 singlePeerBareId = 0;
+ 	quint64 singlePeerAccessHash = 0;
+ 	qint32 singlePeerFrom = 0, singlePeerTill = 0;
++	quint32 includeVoiceTranscriptions = 0;
+ 	file.stream
+ 		>> types
+ 		>> fullChats
+@@ -3052,6 +3055,9 @@
+ 	}
+ 	if (!file.stream.atEnd()) {
+ 		file.stream >> singlePeerFrom >> singlePeerTill;
++	}
++	if (!file.stream.atEnd()) {
++		file.stream >> includeVoiceTranscriptions;
+ 	}
+ 	auto result = Export::Settings();
+ 	result.types = Export::Settings::Types::from_raw(types);
+@@ -3093,6 +3099,7 @@
+ 	}();
+ 	result.singlePeerFrom = singlePeerFrom;
+ 	result.singlePeerTill = singlePeerTill;
++	result.includeVoiceTranscriptions = (includeVoiceTranscriptions == 1);
+ 	return (file.stream.status() == QDataStream::Ok && result.validate())
+ 		? result
+ 		: Export::Settings();
+diff --git a/Telegram/SourceFiles/export/data/export_data_types.h b/Telegram/SourceFiles/export/data/export_data_types.h
+--- a/Telegram/SourceFiles/export/data/export_data_types.h
++++ b/Telegram/SourceFiles/export/data/export_data_types.h
+@@ -1254,6 +1254,13 @@
+ 	int64 buttonId = 0;
+ };
+ 
++struct VoiceTranscription {
++	Utf8String status;
++	Utf8String text;
++	Utf8String error;
++	uint64 id = 0;
++};
++
+ struct Message {
+ 	int32 id = 0;
+ 	TimeId date = 0;
+@@ -1278,6 +1285,7 @@
+ 	bool out = false;
+ 	std::vector<std::vector<HistoryMessageMarkupButton>> inlineButtonRows;
+ 	std::optional<RichMessage> richMessage;
++	std::optional<VoiceTranscription> voiceTranscription;
+ 
+ 	File &file();
+ 	const File &file() const;
+diff --git a/Telegram/SourceFiles/export/output/export_output_json.cpp b/Telegram/SourceFiles/export/output/export_output_json.cpp
+--- a/Telegram/SourceFiles/export/output/export_output_json.cpp
++++ b/Telegram/SourceFiles/export/output/export_output_json.cpp
+@@ -2296,6 +2296,17 @@
+ 	} else {
+ 		pushBare("text", SerializeText(context, message.text));
+ 		pushBare("text_entities", SerializeText(context, message.text, true));
++	}
++
++	if (message.voiceTranscription) {
++		const auto &data = *message.voiceTranscription;
++		pushBare("voice_transcription", SerializeObject(context, {
++			{ "provider", SerializeString("telegram") },
++			{ "status", SerializeString(data.status) },
++			{ "text", SerializeString(data.text) },
++			{ "error", SerializeString(data.error) },
++			{ "transcription_id", SerializeString(Data::NumberToString(data.id)) },
++		}));
+ 	}
+ 
+ 	if (!message.inlineButtonRows.empty()) {
+diff --git a/Telegram/SourceFiles/export/output/export_output_html.cpp b/Telegram/SourceFiles/export/output/export_output_html.cpp
+--- a/Telegram/SourceFiles/export/output/export_output_html.cpp
++++ b/Telegram/SourceFiles/export/output/export_output_html.cpp
+@@ -4557,6 +4557,21 @@
+ 			block.append(popTag());
+ 		}
+ 	}
++	if (message.voiceTranscription) {
++		const auto &data = *message.voiceTranscription;
++		block.append(pushDiv("details"));
++		block.append("Voice transcription (Telegram): ");
++		block.append(SerializeString(data.status));
++		if (!data.error.isEmpty()) {
++			block.append(" — " + SerializeString(data.error));
++		}
++		block.append(popTag());
++		if (!data.text.isEmpty()) {
++			block.append(pushDiv("text"));
++			block.append(SerializeString(data.text));
++			block.append(popTag());
++		}
++	}
+ 	if (!message.inlineButtonRows.empty()) {
+ 		using Type = HistoryMessageMarkupButton::Type;
+ 		const auto endline = u" | "_q;
+diff --git a/Telegram/SourceFiles/export/export_api_wrap.h b/Telegram/SourceFiles/export/export_api_wrap.h
+--- a/Telegram/SourceFiles/export/export_api_wrap.h
++++ b/Telegram/SourceFiles/export/export_api_wrap.h
+@@ -76,6 +76,8 @@
+ 		int itemIndex = 0;
+ 		int64 ready = 0;
+ 		int64 total = 0;
++		bool transcribing = false;
++		int64 transcriptionWaitSeconds = 0;
+ 	};
+ 	void requestUserpics(
+ 		FnMut<bool(Data::UserpicsInfo&&)> start,
+@@ -118,6 +120,8 @@
+ 	void finishExport(FnMut<void()> done);
+ 	void skipFile(uint64 randomId);
+ 	void cancelExportFast();
++	[[nodiscard]] int transcriptionsDone() const;
++	[[nodiscard]] int transcriptionsFailed() const;
+ 
+ 	~ApiWrap();
+ 
+@@ -217,6 +221,12 @@
+ 		FnMut<void(MTPmessages_Messages&&)> done);
+ 	void startMessagesSlice(Data::MessagesSlice &&slice);
+ 	void resumeMessagesSlice();
++	void transcribeNextMessage();
++	void transcriptionDone(const MTPmessages_TranscribedAudio &result);
++	void transcriptionFailed(const MTP::Error &error);
++	void finishTranscription();
++	void scheduleTranscription(crl::time delay);
++	void transcriptionProgress(crl::time wait = 0);
+ 	void hydrateMessageDone(
+ 		bool topic,
+ 		int index,
+@@ -330,7 +340,14 @@
+ 	void error(const QString &text);
+ 	void ioError(const Output::Result &result);
+ 
++	Fn<void(FnMut<void()>)> _runner;
+ 	MTP::ConcurrentSender _mtp;
++	mtpRequestId _transcriptionRequestId = 0;
++	uint64 _transcriptionGeneration = 0;
++	QByteArray _transcriptionUnavailable;
++	int _transcriptionsDone = 0;
++	int _transcriptionsFailed = 0;
++	bool _transcriptionsCancelled = false;
+ 	std::optional<uint64> _takeoutId;
+ 	std::optional<UserId> _selfId;
+ 	Output::Stats *_stats = nullptr;
+diff --git a/Telegram/SourceFiles/export/export_api_wrap.cpp b/Telegram/SourceFiles/export/export_api_wrap.cpp
+--- a/Telegram/SourceFiles/export/export_api_wrap.cpp
++++ b/Telegram/SourceFiles/export/export_api_wrap.cpp
+@@ -8,11 +8,13 @@
+ #include "export/export_api_wrap.h"
+ 
+ #include "export/export_settings.h"
++#include "export/export_transcription_policy.h"
+ #include "export/data/export_data_types.h"
+ #include "export/output/export_output_result.h"
+ #include "export/output/export_output_file.h"
+ #include "mtproto/mtproto_response.h"
+ #include "base/bytes.h"
++#include "base/call_delayed.h"
+ #include "base/options.h"
+ #include "base/random.h"
+ #include <set>
+@@ -569,6 +571,8 @@
+ 	std::vector<MessageFileWork> messageFileWork;
+ 	bool lastSlice = false;
+ 	int hydrationIndex = 0;
++	int transcriptionIndex = 0;
++	TranscriptionRetryPolicy transcriptionRetry;
+ 	int fileIndex = 0;
+ 	int messageFileWorkIndex = 0;
+ 	int messageFileWorkMessageIndex = -1;
+@@ -774,7 +778,8 @@
+ ApiWrap::ApiWrap(
+ 	base::weak_qptr<MTP::Instance> weak,
+ 	Fn<void(FnMut<void()>)> runner)
+-: _mtp(weak, std::move(runner))
++: _runner(std::move(runner))
++, _mtp(weak, _runner)
+ , _fileCache(std::make_unique<LoadedFileCache>(kLocationCacheSize)) {
+ }
+ 
+@@ -1891,6 +1896,11 @@
+ }
+ 
+ void ApiWrap::cancelExportFast() {
++	_transcriptionsCancelled = true;
++	++_transcriptionGeneration;
++	if (_transcriptionRequestId) {
++		_mtp.request(base::take(_transcriptionRequestId)).cancel();
++	}
+ 	if (_takeoutId.has_value()) {
+ 		const auto requestId = mainRequest(MTPaccount_FinishTakeoutSession(
+ 			MTP_flags(0)
+@@ -2325,6 +2335,8 @@
+ 	}
+ 	process->slice = std::move(slice);
+ 	process->hydrationIndex = 0;
++	process->transcriptionIndex = 0;
++	process->transcriptionRetry = {};
+ 	process->fileIndex = 0;
+ 	process->messageFileWork.clear();
+ 	process->messageFileWorkIndex = 0;
+@@ -2374,12 +2386,178 @@
+ 		return;
+ 	}
+ 
++	transcribeNextMessage();
++}
++
++void ApiWrap::transcribeNextMessage() {
++	if (_transcriptionsCancelled) {
++		return;
++	}
++	const auto topic = (_topicProcess != nullptr);
++	const auto process = topic
++		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
++		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
++	Expects(process != nullptr && process->slice.has_value());
++	Expects(!_transcriptionRequestId);
++
++	auto &list = process->slice->list;
++	while (_settings->includeVoiceTranscriptions
++		&& process->transcriptionIndex < list.size()) {
++		auto &message = list[process->transcriptionIndex];
++		const auto document = std::get_if<Data::Document>(
++			&message.media.content);
++		if (!document
++			|| !document->isVoiceMessage
++			|| Data::SkipMessageByDate(message, *_settings)) {
++			++process->transcriptionIndex;
++			continue;
++		}
++		if (!message.voiceTranscription) {
++			message.voiceTranscription.emplace();
++		}
++		if (!_transcriptionUnavailable.isEmpty()) {
++			message.voiceTranscription->status = "failed";
++			message.voiceTranscription->error = _transcriptionUnavailable;
++			++_transcriptionsFailed;
++			++process->transcriptionIndex;
++			continue;
++		}
++		auto peer = topic ? _topicProcess->inputPeer : _chatProcess->info.input;
++		if (!topic) {
++			const auto split = _chatProcess->info.splits[
++				_chatProcess->localSplitIndex];
++			if (split < 0) {
++				peer = _chatProcess->info.migratedFromInput;
++			}
++		}
++		transcriptionProgress();
++		if (_transcriptionsCancelled) {
++			return;
++		}
++		_transcriptionRequestId = _mtp.request(MTPmessages_TranscribeAudio(
++			peer,
++			MTP_int(message.id)
++		)).done([=](const MTPmessages_TranscribedAudio &result) {
++			_transcriptionRequestId = 0;
++			if (!_transcriptionsCancelled) {
++				transcriptionDone(result);
++			}
++		}).fail([=](const MTP::Error &error) {
++			_transcriptionRequestId = 0;
++			if (!_transcriptionsCancelled) {
++				transcriptionFailed(error);
++			}
++		}).handleFloodErrors().send();
++		return;
++	}
+ 	collectMessagesCustomEmoji(*process->slice);
+ 	if (topic) {
+ 		resolveTopicCustomEmoji();
+ 	} else {
+ 		resolveCustomEmoji();
+ 	}
++}
++
++void ApiWrap::transcriptionDone(const MTPmessages_TranscribedAudio &result) {
++	const auto process = _topicProcess
++		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
++		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
++	auto &entry = *process->slice->list[
++		process->transcriptionIndex].voiceTranscription;
++	const auto &data = result.data();
++	entry.id = data.vtranscription_id().v;
++	entry.text = Data::ParseString(data.vtext());
++	if (data.is_pending()) {
++		entry.status = "pending";
++		if (process->transcriptionRetry.retryPending()) {
++			scheduleTranscription(5000);
++			return;
++		}
++		entry.error = "TRANSCRIPTION_TIMEOUT";
++	} else {
++		entry.status = entry.text.isEmpty() ? "empty" : "done";
++	}
++	finishTranscription();
++}
++
++void ApiWrap::transcriptionFailed(const MTP::Error &error) {
++	const auto process = _topicProcess
++		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
++		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
++	const auto type = error.type().toUtf8();
++	const auto view = std::string_view(type.constData(), type.size());
++	if (const auto delay = process->transcriptionRetry.floodDelay(view)) {
++		scheduleTranscription(*delay);
++		return;
++	}
++	auto &entry = *process->slice->list[
++		process->transcriptionIndex].voiceTranscription;
++	entry.status = "failed";
++	entry.error = type;
++	if (TranscriptionRetryPolicy::IsFlood(view)) {
++		_transcriptionUnavailable = type;
++	}
++	finishTranscription();
++}
++
++void ApiWrap::finishTranscription() {
++	const auto process = _topicProcess
++		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
++		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
++	const auto &entry = *process->slice->list[
++		process->transcriptionIndex].voiceTranscription;
++	if (entry.status == "done") {
++		++_transcriptionsDone;
++	} else {
++		++_transcriptionsFailed;
++	}
++	++process->transcriptionIndex;
++	process->transcriptionRetry = {};
++	scheduleTranscription(1000);
++}
++
++void ApiWrap::scheduleTranscription(crl::time delay) {
++	const auto generation = ++_transcriptionGeneration;
++	const auto runner = _runner;
++	const auto interval = std::min(delay, crl::time(60'000));
++	transcriptionProgress(delay);
++	// The runner is owned by the controller's weak_on_queue.
++	crl::on_main([=] {
++		base::call_delayed(interval, [=] {
++			runner([=] {
++				if (_transcriptionsCancelled
++					|| generation != _transcriptionGeneration) {
++					return;
++				}
++				if (delay > interval) {
++					scheduleTranscription(delay - interval);
++				} else {
++					transcribeNextMessage();
++				}
++			});
++		});
++	});
++}
++
++void ApiWrap::transcriptionProgress(crl::time wait) {
++	const auto process = _topicProcess
++		? static_cast<AbstractMessagesProcess*>(_topicProcess.get())
++		: static_cast<AbstractMessagesProcess*>(_chatProcess.get());
++	if (!process->fileProgress(DownloadProgress{
++		.itemIndex = process->transcriptionIndex,
++		.transcribing = true,
++		.transcriptionWaitSeconds = (wait + 999) / 1000,
++	})) {
++		_transcriptionsCancelled = true;
++	}
++}
++
++int ApiWrap::transcriptionsDone() const {
++	return _transcriptionsDone;
++}
++
++int ApiWrap::transcriptionsFailed() const {
++	return _transcriptionsFailed;
+ }
+ 
+ void ApiWrap::hydrateMessageDone(
+diff --git a/Telegram/SourceFiles/export/export_controller.h b/Telegram/SourceFiles/export/export_controller.h
+--- a/Telegram/SourceFiles/export/export_controller.h
++++ b/Telegram/SourceFiles/export/export_controller.h
+@@ -73,6 +73,8 @@
+ 	QString bytesName;
+ 	int64 bytesLoaded = 0;
+ 	int64 bytesCount = 0;
++	bool transcribing = false;
++	int64 transcriptionWaitSeconds = 0;
+ };
+ 
+ struct ApiErrorState {
+@@ -90,6 +92,8 @@
+ 	QString path;
+ 	int filesCount = 0;
+ 	int64 bytesCount = 0;
++	int transcriptionsDone = 0;
++	int transcriptionsFailed = 0;
+ };
+ 
+ using State = std::variant<
+diff --git a/Telegram/SourceFiles/export/export_controller.cpp b/Telegram/SourceFiles/export/export_controller.cpp
+--- a/Telegram/SourceFiles/export/export_controller.cpp
++++ b/Telegram/SourceFiles/export/export_controller.cpp
+@@ -753,6 +753,8 @@
+ 	}
+ 	result.bytesLoaded = progress.ready;
+ 	result.bytesCount = progress.total;
++	result.transcribing = progress.transcribing;
++	result.transcriptionWaitSeconds = progress.transcriptionWaitSeconds;
+ }
+ 
+ int ControllerObject::substepsInStep(Step step) const {
+@@ -823,6 +825,8 @@
+ 		}
+ 		result.bytesLoaded = progress.ready;
+ 		result.bytesCount = progress.total;
++		result.transcribing = progress.transcribing;
++		result.transcriptionWaitSeconds = progress.transcriptionWaitSeconds;
+ 	});
+ }
+ 
+@@ -830,7 +834,9 @@
+ 	setState(FinishedState{
+ 		_writer->mainFilePath(),
+ 		_stats.filesCount(),
+-		_stats.bytesCount() });
++		_stats.bytesCount(),
++		_api.transcriptionsDone(),
++		_api.transcriptionsFailed() });
+ }
+ 
+ Controller::Controller(
+diff --git a/Telegram/SourceFiles/export/view/export_view_content.cpp b/Telegram/SourceFiles/export/view/export_view_content.cpp
+--- a/Telegram/SourceFiles/export/view/export_view_content.cpp
++++ b/Telegram/SourceFiles/export/view/export_view_content.cpp
+@@ -160,6 +160,18 @@
+ 		break;
+ 	default: Unexpected("Step in ContentFromState.");
+ 	}
++	if (state.transcribing) {
++		push(
++			u"transcription"_q,
++			tr::lng_export_transcribing(tr::now),
++			state.transcriptionWaitSeconds
++				? tr::lng_export_transcription_wait(
++					tr::now,
++					lt_duration,
++					QString::number(state.transcriptionWaitSeconds) + u" s"_q)
++				: QString(),
++			0.);
++	}
+ 	const auto requiredRows = settings->onlySinglePeer() ? 2 : 3;
+ 	while (result.rows.size() < requiredRows) {
+ 		result.rows.emplace_back();
+@@ -190,6 +202,26 @@
+ 			Ui::FormatSizeText(state.bytesCount)),
+ 		QString(),
+ 		1. });
++	if (state.transcriptionsDone || state.transcriptionsFailed) {
++		result.rows.push_back({
++			Content::kDoneId,
++			tr::lng_export_transcriptions_done(
++				tr::now,
++				lt_amount,
++				QString::number(state.transcriptionsDone)),
++			QString(),
++			1. });
++	}
++	if (state.transcriptionsFailed) {
++		result.rows.push_back({
++			Content::kDoneId,
++			tr::lng_export_transcriptions_failed(
++				tr::now,
++				lt_amount,
++				QString::number(state.transcriptionsFailed)),
++			QString(),
++			1. });
++	}
+ 	return result;
+ }
+ 
+diff --git a/Telegram/cmake/td_export.cmake b/Telegram/cmake/td_export.cmake
+--- a/Telegram/cmake/td_export.cmake
++++ b/Telegram/cmake/td_export.cmake
+@@ -18,6 +18,7 @@
+     export/export_pch.h
+     export/export_settings.cpp
+     export/export_settings.h
++    export/export_transcription_policy.h
+     export/data/export_data_types.cpp
+     export/data/export_data_types.h
+     export/output/export_output_abstract.cpp
+diff --git a/Telegram/SourceFiles/export/export_transcription_policy.h b/Telegram/SourceFiles/export/export_transcription_policy.h
+new file mode 100644
+--- /dev/null
++++ b/Telegram/SourceFiles/export/export_transcription_policy.h
+@@ -0,0 +1,56 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <algorithm>
++#include <charconv>
++#include <cstdint>
++#include <optional>
++#include <string_view>
++
++namespace Export {
++
++struct TranscriptionRetryPolicy {
++	int pendingAttempts = 0;
++	int floodAttempts = 0;
++
++	[[nodiscard]] bool retryPending() {
++		floodAttempts = 0;
++		return (++pendingAttempts < 36);
++	}
++
++	[[nodiscard]] static bool IsFlood(std::string_view error) {
++		return error == "FLOOD"
++			|| error.starts_with("FLOOD_WAIT_")
++			|| error.starts_with("FLOOD_PREMIUM_WAIT_");
++	}
++
++	[[nodiscard]] std::optional<std::int64_t> floodDelay(
++			std::string_view error) {
++		if (!IsFlood(error) || ++floodAttempts > 5) {
++			return std::nullopt;
++		}
++		if (error == "FLOOD") {
++			return std::int64_t(30'000) * floodAttempts;
++		}
++		const auto suffix = error.substr(error.find_last_of('_') + 1);
++		auto seconds = std::int32_t(0);
++		const auto [end, code] = std::from_chars(
++			suffix.data(),
++			suffix.data() + suffix.size(),
++			seconds);
++		if (code != std::errc()
++			|| end != suffix.data() + suffix.size()
++			|| seconds < 0) {
++			return std::nullopt;
++		}
++		return std::int64_t(std::max(seconds, 1)) * 1000;
++	}
++};
++
++} // namespace Export
+diff --git a/Telegram/Tests/export_transcriptions/run.py b/Telegram/Tests/export_transcriptions/run.py
+new file mode 100644
+--- /dev/null
++++ b/Telegram/Tests/export_transcriptions/run.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""Exercise the production queue with fake MTProto, clock and storage adapters.
++
++Requires a C++20 compiler; does not require Qt or contact Telegram. This checks
++queue behavior, not compatibility with the real Qt/MTProto types or a full build.
++"""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++here = Path(__file__).resolve().parent
++root = here.parents[2]
++source = (root / 'Telegram/SourceFiles/export/export_api_wrap.cpp').read_text()
++start = source.index('void ApiWrap::transcribeNextMessage()')
++end = source.index('void ApiWrap::hydrateMessageDone(', start)
++harness = (here / 'worker.cpp.in').read_text()
++assert harness.count('// PRODUCTION_METHODS') == 1
++harness = harness.replace('// PRODUCTION_METHODS', source[start:end])
++with tempfile.TemporaryDirectory(prefix='telegram-transcription-test-') as tmp:
++    cpp = Path(tmp) / 'worker.cpp'
++    binary = Path(tmp) / 'worker'
++    cpp.write_text(harness)
++    subprocess.run([
++        os.environ.get('CXX', 'clang++'), '-std=c++20', '-Wall', '-Wextra',
++        '-Werror', '-Wno-deprecated-this-capture', '-Wno-sign-compare',
++        '-I', str(root / 'Telegram/SourceFiles'), str(cpp), '-o', str(binary),
++    ], check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/Telegram/Tests/export_transcriptions/worker.cpp.in b/Telegram/Tests/export_transcriptions/worker.cpp.in
+new file mode 100644
+--- /dev/null
++++ b/Telegram/Tests/export_transcriptions/worker.cpp.in
+@@ -0,0 +1,307 @@
++#include "export/export_transcription_policy.h"
++
++#include <cassert>
++#include <deque>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
++#include <utility>
++#include <variant>
++#include <vector>
++
++using uint64 = std::uint64_t;
++using int64 = std::int64_t;
++using mtpRequestId = int;
++template <typename T> using FnMut = std::function<T>;
++#define Expects(x) assert(x)
++
++struct QByteArray : std::string {
++    using std::string::string;
++    using std::string::operator=;
++    bool isEmpty() const { return empty(); }
++    const char *constData() const { return data(); }
++    QByteArray toUtf8() const { return *this; }
++};
++namespace Clock {
++int64 now = 0;
++std::multimap<int64, FnMut<void()>> tasks;
++void Run() {
++    auto count = 0;
++    while (!tasks.empty()) {
++        assert(++count < 10000);
++        auto i = tasks.begin();
++        now = i->first;
++        auto task = std::move(i->second);
++        tasks.erase(i);
++        task();
++    }
++}
++void Reset() { tasks.clear(); now = 0; }
++}
++namespace crl {
++using time = int64;
++template <typename F> void on_main(F f) { f(); }
++}
++namespace base {
++template <typename F> void call_delayed(crl::time delay, F f) {
++    Clock::tasks.emplace(Clock::now + delay, std::move(f));
++}
++}
++struct MTPmessages_TranscribedAudio {
++    struct Data {
++        bool pending = false;
++        QByteArray text;
++        uint64 id = 42;
++        bool is_pending() const { return pending; }
++        const QByteArray &vtext() const { return text; }
++        struct Long { uint64 v; };
++        Long vtranscription_id() const { return {id}; }
++    } value;
++    const Data &data() const { return value; }
++};
++struct MTPmessages_TranscribeAudio { int peer; int id; };
++int MTP_int(int value) { return value; }
++namespace MTP {
++struct Error {
++    QByteArray value;
++    const QByteArray &type() const { return value; }
++};
++struct Reply {
++    bool pending = false;
++    QByteArray text = "complete";
++    QByteArray error;
++};
++struct Sender {
++    struct Sent { int peer; int id; int64 at; };
++    std::vector<Sent> sent;
++    std::deque<Reply> replies;
++    int nextId = 0;
++    struct Builder {
++        Sender *owner;
++        MTPmessages_TranscribeAudio call;
++        FnMut<void(const MTPmessages_TranscribedAudio&)> success;
++        FnMut<void(const Error&)> failure;
++        Builder &done(decltype(success) f) { success = std::move(f); return *this; }
++        Builder &fail(decltype(failure) f) { failure = std::move(f); return *this; }
++        Builder &handleFloodErrors() { return *this; }
++        mtpRequestId send() {
++            owner->sent.push_back({call.peer, call.id, Clock::now});
++            auto reply = Reply();
++            if (!owner->replies.empty()) {
++                reply = owner->replies.front();
++                owner->replies.pop_front();
++            }
++            base::call_delayed(1, [=, *this] {
++                if (!reply.error.empty()) {
++                    failure(Error{reply.error});
++                } else {
++                    success(MTPmessages_TranscribedAudio{{reply.pending, reply.text, 42}});
++                }
++            });
++            return ++owner->nextId;
++        }
++    };
++    Builder request(MTPmessages_TranscribeAudio call) {
++        return {this, call, {}, {}};
++    }
++};
++}
++
++namespace Export {
++struct Settings {
++    bool includeVoiceTranscriptions = true;
++    int from = 0;
++    int till = 100;
++};
++namespace Data {
++struct Document { bool isVoiceMessage = false; };
++struct VoiceTranscription {
++    QByteArray status, text, error;
++    uint64 id = 0;
++};
++struct Message {
++    int id = 0;
++    int date = 1;
++    struct Media { std::variant<std::monostate, Document> content; } media;
++    std::optional<VoiceTranscription> voiceTranscription;
++};
++struct MessagesSlice { std::vector<Message> list; };
++bool SkipMessageByDate(const Message &m, const Settings &s) {
++    return m.date < s.from || m.date >= s.till;
++}
++QByteArray ParseString(const QByteArray &s) { return s; }
++}
++class ApiWrap {
++public:
++    struct DownloadProgress {
++        int itemIndex = 0;
++        bool transcribing = false;
++        int64 transcriptionWaitSeconds = 0;
++    };
++    struct AbstractMessagesProcess {
++        std::optional<Data::MessagesSlice> slice;
++        int transcriptionIndex = 0;
++        TranscriptionRetryPolicy transcriptionRetry;
++        std::vector<DownloadProgress> progress;
++        bool acceptProgress = true;
++        bool fileProgress(DownloadProgress p) {
++            progress.push_back(p);
++            return acceptProgress;
++        }
++    };
++    struct ChatProcess : AbstractMessagesProcess {
++        struct Info {
++            int input = 11;
++            int migratedFromInput = 22;
++            std::vector<int> splits = {0};
++        } info;
++        int localSplitIndex = 0;
++    };
++    struct TopicProcess : AbstractMessagesProcess { int inputPeer = 33; };
++    std::unique_ptr<Settings> _settings = std::make_unique<Settings>();
++    std::unique_ptr<ChatProcess> _chatProcess = std::make_unique<ChatProcess>();
++    std::unique_ptr<TopicProcess> _topicProcess;
++    MTP::Sender _mtp;
++    FnMut<void(FnMut<void()>)> _runner = [](FnMut<void()> f) { f(); };
++    mtpRequestId _transcriptionRequestId = 0;
++    uint64 _transcriptionGeneration = 0;
++    QByteArray _transcriptionUnavailable;
++    bool _transcriptionsCancelled = false;
++    int _transcriptionsDone = 0;
++    int _transcriptionsFailed = 0;
++    int continued = 0;
++
++    void collectMessagesCustomEmoji(const Data::MessagesSlice &) {}
++    void resolveTopicCustomEmoji() { ++continued; }
++    void resolveCustomEmoji() { ++continued; }
++    void transcribeNextMessage();
++    void transcriptionDone(const MTPmessages_TranscribedAudio &);
++    void transcriptionFailed(const MTP::Error &);
++    void finishTranscription();
++    void scheduleTranscription(crl::time);
++    void transcriptionProgress(crl::time wait = 0);
++    int transcriptionsDone() const;
++    int transcriptionsFailed() const;
++
++};
++
++// PRODUCTION_METHODS
++
++Data::Message Voice(int id, int date = 1) {
++    return {id, date, {{Data::Document{true}}}, {}};
++}
++void Fill(ApiWrap &api, std::vector<Data::Message> list) {
++    api._chatProcess->slice = Data::MessagesSlice{std::move(list)};
++}
++const Data::VoiceTranscription &Entry(const ApiWrap &api, int index = 0) {
++    return *api._chatProcess->slice->list[index].voiceTranscription;
++}
++}
++
++int main() {
++    using namespace Export;
++    {
++        TranscriptionRetryPolicy policy;
++        assert(policy.floodDelay("FLOOD_WAIT_3600") == 3'600'000);
++        assert(policy.floodDelay("FLOOD_PREMIUM_WAIT_2") == 2000);
++        assert(!policy.floodDelay("FLOOD_WAIT_-5"));
++        assert(!policy.floodDelay("FLOOD_WAIT_1extra"));
++        assert(!policy.floodDelay("FLOOD_WAIT_999999999999999999"));
++        assert(!policy.floodDelay("TRANSCRIPTION_FAILED"));
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._settings->includeVoiceTranscriptions = false;
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.empty() && api.continued == 1);
++        assert(!api._chatProcess->slice->list[0].voiceTranscription);
++    }
++    {
++        Clock::Reset(); ApiWrap api;
++        Fill(api, {Voice(1, 0), Voice(2, 1), Voice(3, 100), Data::Message{}});
++        api._settings->from = 1;
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.size() == 1 && api._mtp.sent[0].id == 2);
++        assert(api.transcriptionsDone() == 1 && api.continued == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(7)});
++        api._chatProcess->info.splits = {-1};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent[0].peer == 22 && api._mtp.sent[0].id == 7);
++    }
++    {
++        Clock::Reset(); ApiWrap api;
++        api._chatProcess.reset(); api._topicProcess = std::make_unique<ApiWrap::TopicProcess>();
++        api._topicProcess->slice = Data::MessagesSlice{{Voice(9)}};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent[0].peer == 33 && api.continued == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._mtp.replies = {{true, "partial", {}}, {false, "full", {}}};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.size() == 2 && Entry(api).text == "full");
++        assert(Entry(api).status == "done" && api.transcriptionsFailed() == 0);
++        assert(api._mtp.sent[1].at >= 5000);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._mtp.replies.assign(36, {true, "partial", {}});
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.size() == 36 && Entry(api).status == "pending");
++        assert(Entry(api).text == "partial" && Entry(api).error == "TRANSCRIPTION_TIMEOUT");
++        assert(api.transcriptionsFailed() == 1 && api.continued == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1), Voice(2)});
++        api._mtp.replies = {{false, {}, "MSG_VOICE_TOO_LONG"}, {false, "ok", {}}};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(Entry(api).status == "failed" && Entry(api, 1).status == "done");
++        assert(api.transcriptionsDone() == 1 && api.transcriptionsFailed() == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._mtp.replies = {{false, {}, "FLOOD_PREMIUM_WAIT_125"}, {false, "ok", {}}};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.size() == 2 && api._mtp.sent[1].at >= 125000);
++        assert(Entry(api).status == "done");
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1), Voice(2)});
++        api._mtp.replies.assign(6, {false, {}, "FLOOD"});
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.size() == 6 && api.transcriptionsFailed() == 2);
++        assert(Entry(api, 1).error == "FLOOD" && api.continued == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._mtp.replies = {{false, {}, {}}};
++        api.transcribeNextMessage(); Clock::Run();
++        assert(Entry(api).status == "empty" && api.transcriptionsFailed() == 1);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._mtp.replies = {{true, "partial", {}}};
++        api.transcribeNextMessage();
++        base::call_delayed(2, [&] { api._transcriptionsCancelled = true; });
++        Clock::Run();
++        assert(api._mtp.sent.size() == 1 && api.continued == 0);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api.transcribeNextMessage(); api._transcriptionsCancelled = true;
++        Clock::Run();
++        assert(api.transcriptionsDone() == 0 && api.continued == 0);
++    }
++    {
++        Clock::Reset(); ApiWrap api; Fill(api, {Voice(1)});
++        api._chatProcess->acceptProgress = false;
++        api.transcribeNextMessage(); Clock::Run();
++        assert(api._mtp.sent.empty());
++    }
++    std::cout << "PASS: retry policy and 13 production-queue scenarios\n";
++}
