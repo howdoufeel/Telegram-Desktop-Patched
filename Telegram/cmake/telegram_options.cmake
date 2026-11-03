@@ -36,6 +36,15 @@ if (TDESKTOP_API_ID STREQUAL "0" OR TDESKTOP_API_HASH STREQUAL "")
     " ")
 endif()
 
+if (APPLE AND NOT DESKTOP_APP_DISABLE_AUTOUPDATE)
+    message(FATAL_ERROR
+    " \n"
+    " Telegram Desktop Patched is installed as a separate macOS app.\n"
+    " An official update would replace it and remove the patch,\n"
+    " so configure it with -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON.\n"
+    " ")
+endif()
+
 if (DESKTOP_APP_DISABLE_AUTOUPDATE)
     target_compile_definitions(Telegram PRIVATE TDESKTOP_DISABLE_AUTOUPDATE)
 endif()
